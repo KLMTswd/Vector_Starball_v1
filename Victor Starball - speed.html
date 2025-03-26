@@ -1,0 +1,334 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>3D Audio Visualizer</title>
+    <style>
+        body { margin: 0; overflow: hidden; }
+        #controls {
+            position: absolute;
+            top: 20px;
+            left: 20px;
+            z-index: 100;
+            color: white;
+        }
+        .custom-button {
+            background: rgba(123, 31, 162, 0.3);
+            color: white;
+            padding: 10px 20px;
+            border-radius: 5px;
+            cursor: pointer;
+            margin: 5px;
+            border: 1px solid rgba(123, 31, 162, 0.5);
+            position: relative;
+            overflow: hidden;
+            transition: all 0.3s ease;
+            z-index: 1;
+        }
+        .custom-button:hover {
+            background: rgba(123, 31, 162, 0.6);
+            box-shadow: 0 0 10px rgba(123, 31, 162, 10);
+        }
+        .custom-button::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: -100%;
+            width: 100%;
+            height: 100%;
+            background: linear-gradient(
+                90deg,
+                transparent,
+                rgba(255, 255, 255, 0.3),
+                transparent
+            );
+            transition: all 0.7s ease;
+            z-index: -1;
+            border-radius: 3px;
+        }
+        .custom-button:hover::before {
+            left: 100%;
+        }
+        input[type="file"] { display: none; }
+        #loading {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            color: white;
+            font-size: 20px;
+            display: none;
+        }
+        #progress-bar {
+            width: 200px;
+            height: 10px;
+            background: #444;
+            border-radius: 5px;
+            margin-top: 10px;
+            overflow: hidden;
+        }
+        #progress {
+            width: 0;
+            height: 100%;
+            background: #7b1fa2;
+            transition: width 0.3s;
+        }
+    </style>
+</head>
+<body>
+    <div id="controls">
+        <label class="custom-button" for="audioInput">选择音频</label>
+        <button class="custom-button" id="playPauseBtn" disabled>播放/暂停</button>
+        <input type="file" id="audioInput" accept="audio/*" />
+        <div id="progress-bar">
+            <div id="progress"></div>
+        </div>
+        <div style="margin-top: 10px;">按 <strong>P键</strong> 切换摄像头模式</div>
+    </div>
+    <div id="loading">加载中，请稍候...</div>
+
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/three@0.132.2/examples/js/controls/OrbitControls.js"></script>
+
+    <script>
+        let scene, camera, renderer, analyzer, audioElem, source;
+        let waveform, ball, isPlaying = false;
+        const FLUID_COLOR = new THREE.Color(0x7b1fa2);
+        const audioContext = new (window.AudioContext || window.webkitAudioContext)();
+
+        // 低频加速相关变量
+        let lastBassHitTime = 0;
+        let isBoosting = false;
+        const BASS_THRESHOLD = 180; // 低频阈值
+        const BOOST_DURATION = 1000; // 加速持续时间(ms)
+        const BASE_SPEED = 0.1; // 基础速度
+        const BOOST_SPEED = 0.3; // 加速速度
+        const BOOST_SCALE = 1.14514; // 加速时放大倍数
+
+        let roadLine, stars, ballTrail = [];
+        const TRAIL_LENGTH = 10;
+        let manualCameraControl = false;
+        let controls;
+
+        function init() {
+            scene = new THREE.Scene();
+            camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
+            renderer = new THREE.WebGLRenderer({ antialias: true });
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            document.body.appendChild(renderer.domElement);
+
+            controls = new THREE.OrbitControls(camera, renderer.domElement);
+            controls.enabled = false;
+
+            analyzer = audioContext.createAnalyser();
+            analyzer.fftSize = 256;
+
+            const geometry = new THREE.BufferGeometry();
+            const positions = new Float32Array(analyzer.frequencyBinCount * 3);
+            geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+
+            waveform = new THREE.Line(geometry, new THREE.LineBasicMaterial({
+                color: FLUID_COLOR,
+                transparent: true,
+                opacity: 0.8
+            }));
+            scene.add(waveform);
+
+            const ballGeometry = new THREE.SphereGeometry(0.5, 32, 32);
+            const ballMaterial = new THREE.ShaderMaterial({
+                uniforms: {
+                    glowColor: { value: FLUID_COLOR },
+                    intensity: { value: 3.0 }
+                },
+                vertexShader: `
+                    varying vec3 vPosition;
+                    void main() {
+                        vPosition = position;
+                        gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+                    }
+                `,
+                fragmentShader: `
+                    uniform vec3 glowColor;
+                    uniform float intensity;
+                    varying vec3 vPosition;
+                    void main() {
+                        float glow = pow(1.0 - length(vPosition), 3.0) * intensity;
+                        gl_FragColor = vec4(glowColor * glow, glow);
+                    }
+                `,
+                transparent: true,
+                blending: THREE.AdditiveBlending
+            });
+            ball = new THREE.Mesh(ballGeometry, ballMaterial);
+            scene.add(ball);
+
+            for (let i = 0; i < TRAIL_LENGTH; i++) {
+                const trailBall = ball.clone();
+                trailBall.material = ball.material.clone();
+                trailBall.material.uniforms.intensity.value = 3.0 * (1 - i / TRAIL_LENGTH);
+                trailBall.material.transparent = true;
+                trailBall.material.opacity = 1 - i / TRAIL_LENGTH;
+                ballTrail.push(trailBall);
+                scene.add(trailBall);
+            }
+
+            const roadGeometry = new THREE.BufferGeometry();
+            const roadPositions = new Float32Array([-10000, -2, 0, 10000, -2, 0]);
+            roadGeometry.setAttribute('position', new THREE.BufferAttribute(roadPositions, 3));
+            roadLine = new THREE.Line(roadGeometry, new THREE.LineBasicMaterial({ color: 0xffffff }));
+            scene.add(roadLine);
+
+            const starGeometry = new THREE.BufferGeometry();
+            const starPositions = [];
+            for (let i = 0; i < 18000; i++) {
+                starPositions.push(
+                    (Math.random() - 0.5) * 9000,
+                    (Math.random() - 0.5) * 9000,
+                    (Math.random() - 0.5) * 9000
+                );
+            }
+            starGeometry.setAttribute('position', new THREE.BufferAttribute(new Float32Array(starPositions), 3));
+            stars = new THREE.Points(starGeometry, new THREE.PointsMaterial({ color: 0xffffff, size: 1.2 }));
+            scene.add(stars);
+
+            scene.add(new THREE.AmbientLight(0x444444));
+            const pointLight = new THREE.PointLight(FLUID_COLOR, 1, 200);
+            pointLight.position.set(0, 10, 10);
+            scene.add(pointLight);
+
+            camera.position.set(0, 5, 15);
+            camera.lookAt(0, 0, 0);
+        }
+
+        function updateVisualization() {
+            if (!isPlaying) return;
+
+            const dataArray = new Uint8Array(analyzer.frequencyBinCount);
+            analyzer.getByteFrequencyData(dataArray);
+            const time = Date.now() * 0.001;
+            const now = Date.now();
+
+            // 检测低频鼓声（前10个频段）
+            let bassEnergy = 0;
+            for (let i = 0; i < 10; i++) {
+                bassEnergy += dataArray[i];
+            }
+            bassEnergy /= 10;
+
+            // 低频触发加速
+            if (bassEnergy > BASS_THRESHOLD && now - lastBassHitTime > BOOST_DURATION) {
+                lastBassHitTime = now;
+                isBoosting = true;
+                setTimeout(() => isBoosting = false, BOOST_DURATION);
+            }
+
+            // 更新波形
+            const positions = waveform.geometry.attributes.position.array;
+            for (let i = 0; i < positions.length; i += 3) {
+                const idx = i / 3;
+                const value = dataArray[idx] / 128;
+                positions[i] = (ball.position.x - 3) + (idx * 0.15);
+                positions[i + 1] = Math.sin(time + idx * 0.2) * value * 1.5;
+                positions[i + 2] = Math.cos(time + idx * 0.2) * value * 1.5;
+            }
+            waveform.geometry.attributes.position.needsUpdate = true;
+
+            // 更新小球 - 根据是否加速调整速度和大小
+            const currentSpeed = isBoosting ? BOOST_SPEED : BASE_SPEED;
+            const avg = dataArray.reduce((a, b) => a + b) / dataArray.length;
+            ball.position.x += currentSpeed;
+            ball.position.y = Math.sin(time * 2) * (avg / 50);
+            ball.position.z = Math.cos(time * 2) * (avg / 50);
+            
+            const scaleFactor = isBoosting ? BOOST_SCALE : 1;
+            ball.scale.set(
+                (1 + avg / 150) * scaleFactor,
+                (1 + avg / 150) * scaleFactor,
+                (1 + avg / 150) * scaleFactor
+            );
+
+            // 更新残影
+            for (let i = TRAIL_LENGTH - 1; i > 0; i--) {
+                ballTrail[i].position.copy(ballTrail[i - 1].position);
+                ballTrail[i].scale.copy(ballTrail[i - 1].scale);
+                ballTrail[i].material.opacity = ballTrail[i - 1].material.opacity * 0.8;
+            }
+            ballTrail[0].position.copy(ball.position);
+            ballTrail[0].scale.copy(ball.scale);
+            ballTrail[0].material.opacity = 1;
+
+            // 公路线位置
+            const roadPositions = roadLine.geometry.attributes.position.array;
+            roadPositions[0] = ball.position.x - 10000;
+            roadPositions[3] = ball.position.x + 10000;
+            roadLine.geometry.attributes.position.needsUpdate = true;
+
+            // 自动跟随模式
+            if (!manualCameraControl) {
+                camera.position.x = ball.position.x;
+                camera.lookAt(ball.position.x + 5, ball.position.y, ball.position.z);
+            }
+        }
+
+        function animate() {
+            requestAnimationFrame(animate);
+            updateVisualization();
+            if (manualCameraControl) controls.update();
+            renderer.render(scene, camera);
+        }
+
+        window.addEventListener('keydown', (e) => {
+            if (e.key.toLowerCase() === 'p') {
+                manualCameraControl = !manualCameraControl;
+                controls.enabled = manualCameraControl;
+                controls.target.copy(ball.position);
+            }
+        });
+
+        document.getElementById('audioInput').addEventListener('change', function (e) {
+            const file = e.target.files[0];
+            const url = URL.createObjectURL(file);
+
+            document.getElementById('loading').style.display = 'block';
+            document.getElementById('playPauseBtn').disabled = true;
+
+            audioElem = new Audio(url);
+            audioElem.addEventListener('canplaythrough', () => {
+                document.getElementById('loading').style.display = 'none';
+                document.getElementById('playPauseBtn').disabled = false;
+                document.getElementById('progress').style.width = '100%';
+            });
+
+            audioElem.addEventListener('timeupdate', () => {
+                const progress = (audioElem.currentTime / audioElem.duration) * 100;
+                document.getElementById('progress').style.width = `${progress}%`;
+            });
+
+            audioElem.addEventListener('ended', () => {
+                isPlaying = false;
+                document.getElementById('playPauseBtn').disabled = true;
+            });
+
+            source = audioContext.createMediaElementSource(audioElem);
+            source.connect(analyzer);
+            analyzer.connect(audioContext.destination);
+
+            document.getElementById('playPauseBtn').onclick = async () => {
+                if (audioContext.state === 'suspended') await audioContext.resume();
+                isPlaying ? audioElem.pause() : audioElem.play();
+                isPlaying = !isPlaying;
+            };
+        });
+
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+
+        init();
+        animate();
+    </script>
+</body>
+</html>
